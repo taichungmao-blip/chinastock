@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 1. 配置區 ---
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-MIN_YIELD = 5.0
+MIN_YIELD = 6.0
 MAX_PE = 20.0
 MAX_WORKERS = 10 # 並行線程數
 
