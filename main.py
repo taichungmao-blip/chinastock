@@ -3,7 +3,9 @@ import pandas as pd
 import time
 import requests
 import json
-
+import os
+# 修改配置區，從系統環境變數讀取
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 # --- 配置區 ---
 DISCORD_WEBHOOK_URL = "你的_DISCORD_WEBHOOK_網址"
 MIN_YIELD = 6.0  # 殖利率門檻 (%)
