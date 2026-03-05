@@ -6,8 +6,8 @@ import os
 
 # --- 1. 配置區 ---
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-MIN_YIELD = 5.0  
-MAX_PE = 20.0    
+MIN_YIELD = 4.5 
+MAX_PE = 25.0    
 
 def send_discord_notification(stocks_df):
     if not DISCORD_WEBHOOK_URL:
