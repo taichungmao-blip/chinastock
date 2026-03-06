@@ -10,37 +10,45 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 MIN_YIELD = 4.0
 MAX_PE = 25.0
-MAX_WORKERS = 15 # 適度降低線程數以求穩定
+MAX_WORKERS = 10 # 診斷時降低線程數確保穩定
 
 def fetch_single_stock(symbol, name_map):
-    """抓取數據"""
+    """強化數據抓取邏輯"""
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.info
-        dy = info.get('trailingAnnualDividendYield')
-        pe = info.get('trailingPE')
+        
+        # 強化：多欄位抓取殖利率 (Yahoo 港股有時會換名稱)
+        dy = info.get('trailingAnnualDividendYield') or info.get('dividendYield') or info.get('yield')
+        pe = info.get('trailingPE') or info.get('forwardPE')
         pb = info.get('priceToBook')
 
+        # 診斷：如果是匯豐或建行，強制印出數值
+        if symbol in ["0005.HK", "0939.HK", "1398.HK"]:
+            print(f"🔍 [港股診斷] {symbol}: dy={dy}, pe={pe}, pb={pb}")
+
         if dy is not None and pe is not None:
-            dy_pct = dy * 100
-            if dy_pct >= MIN_YIELD and 0 < pe <= MAX_PE:
+            dy_pct = float(dy) * 100
+            pe_val = float(pe)
+            if dy_pct >= MIN_YIELD and 0 < pe_val <= MAX_PE:
                 return {
                     "名稱": name_map.get(symbol, "未知"),
                     "代碼": symbol,
                     "殖利率(%)": dy_pct,
-                    "PE": pe,
+                    "PE": pe_val,
                     "PB": pb if pb else 0
                 }
-    except:
-        pass
+    except Exception as e:
+        if symbol in ["0005.HK", "0939.HK"]:
+            print(f"❌ [港股報錯] {symbol}: {e}")
     return None
 
 def run_monitor():
     name_map = {}
     
-    # 2. 獲取 A 股清單 (目前穩定)
-    print("--- 步驟 1: 獲取滬深成分股 ---")
-    indices_a = {"000010": "上證180", "000009": "上證380", "399001": "深證成指"}
+    # A 股邏輯不變
+    print("--- 步驟 1: 獲取 A 股清單 ---")
+    indices_a = {"000010": "上證180", "399001": "深證成指"}
     for idx_code, idx_name in indices_a.items():
         try:
             df = ak.index_stock_cons(symbol=idx_code)
@@ -52,40 +60,30 @@ def run_monitor():
                 name_map[f"{raw_code}{suffix}"] = row[c_name]
         except: continue
 
-    # 3. 獲取港股清單 (改用硬核穩定清單，避開 API 封鎖)
-    print("--- 步驟 2: 加載港股核心標的 (HSI/HSCEI) ---")
-    # 這裡內建了港股最核心的高息藍籌股代碼
-    hk_stable_list = {
-        "00005.HK": "匯豐控股", "00939.HK": "建設銀行", "01398.HK": "工商銀行",
-        "03988.HK": "中國銀行", "01288.HK": "農業銀行", "00941.HK": "中國移動",
-        "00883.HK": "中國海洋石油", "00386.HK": "中國石油化工", "00857.HK": "中國石油股份",
-        "02628.HK": "中國人壽", "02318.HK": "中國平安", "00011.HK": "恆生銀行",
-        "00002.HK": "中電控股", "00003.HK": "香港中華煤氣", "00006.HK": "電能實業",
-        "00012.HK": "恆基兆業地產", "00016.HK": "新鴻基地產", "00017.HK": "新世界發展",
-        "00027.HK": "銀河娛樂", "00066.HK": "港鐵公司", "00101.HK": "恆隆地產",
-        "00388.HK": "香港交易所", "00688.HK": "中國海外發展", "00700.HK": "騰訊控股",
-        "00762.HK": "中國聯通", "00823.HK": "領展房產基金", "00960.HK": "龍湖集團",
-        "00992.HK": "聯想集團", "01038.HK": "長江基建集團", "01044.HK": "恆安國際",
-        "01088.HK": "中國神華", "01093.HK": "石藥集團", "01109.HK": "華潤置地",
-        "01113.HK": "長江實業集團", "01177.HK": "中國生物製藥", "01211.HK": "比亞迪股份",
-        "01810.HK": "小米集團", "01928.HK": "金沙中國有限公司", "02020.HK": "安踏體育",
-        "02313.HK": "申洲國際", "02319.HK": "蒙牛乳業", "02331.HK": "李寧",
-        "02382.HK": "舜宇光學科技", "02688.HK": "新奧能源", "03690.HK": "美團-W",
-        "09618.HK": "京東集團-SW", "09988.HK": "阿里巴巴-SW", "09999.HK": "網易-S"
+    print("--- 步驟 2: 加載港股核心標的 (調整代碼格式) ---")
+    # 將港股代碼改為 4 位 (這是 Yahoo Finance 最常用的格式)
+    hk_raw = {
+        "0005": "匯豐控股", "0939": "建設銀行", "1398": "工商銀行",
+        "03988": "中國銀行", "1288": "農業銀行", "0941": "中國移動",
+        "0883": "中國海洋石油", "0386": "中石化", "0857": "中石油",
+        "2628": "中國人壽", "2318": "中國平安", "0011": "恆生銀行",
+        "0002": "中電控股", "1088": "中國神華", "0700": "騰訊控股"
     }
-    name_map.update(hk_stable_list)
+    for k, v in hk_raw.items():
+        # Yahoo Finance 港股代碼需視情況補 4 位或 5 位，我們用 .HK 結尾
+        symbol = f"{k.zfill(4)}.HK" if len(k) <= 4 else f"{k.zfill(5)}.HK"
+        name_map[symbol] = v
 
     codes = list(name_map.keys())
-    print(f"✅ 最終掃描範圍：滬深港共 {len(codes)} 隻標的。")
+    print(f"✅ 最終掃描範圍：{len(codes)} 隻標的。")
 
-    print(f"--- 步驟 3: Yahoo Finance 並行抓取 ---")
+    print(f"--- 步驟 3: 開始抓取 ---")
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_stock = {executor.submit(fetch_single_stock, s, name_map): s for s in codes}
         for i, future in enumerate(as_completed(future_to_stock)):
             res = future.result()
             if res: results.append(res)
-            if (i+1) % 200 == 0: print(f"進度: {i+1}/{len(codes)}...")
 
     if results:
         final_df = pd.DataFrame(results).sort_values(by="殖利率(%)", ascending=False)
@@ -95,8 +93,7 @@ def run_monitor():
 
 def send_to_discord(df):
     top_stocks = df.head(25)
-    msg = "### 🏮 滬深港三棲價值股監控 (穩定版)\n"
-    msg += f"篩選：殖利率 > {MIN_YIELD}% | PE < {MAX_PE}\n"
+    msg = "### 🏮 滬深港價值股監控 (診斷版)\n"
     msg += "```\n"
     msg += f"{'名稱':<8} {'代碼':<10} {'殖利率':<8} {'PE':<6} {'PB':<5}\n"
     msg += "-" * 45 + "\n"
@@ -104,8 +101,7 @@ def send_to_discord(df):
         name = str(row['名稱'])[:4]
         msg += f"{name:<8} {row['代碼']:<10} {row['殖利率(%)']:>7.2f}% {row['PE']:>6.1f} {row['PB']:>5.2f}\n"
     msg += "```\n"
-    msg += f"> *GitHub Runner 更新於: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}*"
-    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=15)
+    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
 
 if __name__ == "__main__":
     run_monitor()
