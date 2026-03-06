@@ -8,26 +8,41 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 1. 配置區 ---
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-MIN_YIELD = 6.0
+MIN_YIELD = 4.0
 MAX_YIELD = 25.0
-MAX_PE = 20.0
-MAX_WORKERS = 20 # 恢復全量掃描，線程數調高
+MAX_PE = 25.0
+MAX_WORKERS = 15
 
 def fetch_single_stock(symbol, name_map):
-    """具備智能單位識別與異常過濾"""
+    """抓取數據並計算 52 週低點距離"""
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.info
         
-        # 兼容多個欄位
-        dy = info.get('trailingAnnualDividendYield') or info.get('dividendYield') or info.get('yield')
+        # 1. 取得股價與 52 週低點
+        price = info.get('regularMarketPrice') or info.get('currentPrice') or info.get('previousClose')
+        low_52w = info.get('fiftyTwoWeekLow')
+        
+        # 2. 計算 52 週低點距離 %
+        dist_from_low = 0
+        if price and low_52w:
+            dist_from_low = ((price - low_52w) / low_52w) * 100
+
+        # 3. 取得殖利率 (手動複算模式)
+        dy_raw = info.get('trailingAnnualDividendYield') or info.get('dividendYield') or 0
+        div_rate = info.get('dividendRate') or 0
+        if price and price > 0:
+            calc_dy = (div_rate / price)
+            dy = max(float(dy_raw), calc_dy)
+        else:
+            dy = float(dy_raw)
+
+        # 4. 取得 PE/PB
         pe = info.get('trailingPE') or info.get('forwardPE')
         pb = info.get('priceToBook')
 
-        if dy is not None and pe is not None:
-            raw_dy = float(dy)
-            # 智能單位縮放：0.05 -> 5.0% | 5.0 -> 5.0%
-            dy_pct = raw_dy if raw_dy > 1.0 else raw_dy * 100
+        if dy > 0 and pe:
+            dy_pct = dy if dy > 1.0 else dy * 100
             pe_val = float(pe)
             
             if MIN_YIELD <= dy_pct <= MAX_YIELD and 0 < pe_val <= MAX_PE:
@@ -36,7 +51,8 @@ def fetch_single_stock(symbol, name_map):
                     "代碼": symbol,
                     "殖利率(%)": dy_pct,
                     "PE": pe_val,
-                    "PB": pb if pb else 0
+                    "PB": pb if pb else 0,
+                    "距低點%": dist_from_low
                 }
     except:
         pass
@@ -45,14 +61,8 @@ def fetch_single_stock(symbol, name_map):
 def run_monitor():
     name_map = {}
     
-    # 步驟 1: 恢復完整的 A 股名單 (包含 380 指數)
-    print("--- 步驟 1: 獲取滬深名單 (180+380+深成) ---")
-    indices_a = {
-        "000010": "上證180", 
-        "000009": "上證380",  # <--- 加回這裡，中谷物流就會回來了
-        "399001": "深證成指"
-    }
-    
+    # 步驟 1: 獲取名單
+    indices_a = {"000010": "上證180", "000009": "上證380", "399001": "深證成指"}
     for idx_code, idx_name in indices_a.items():
         try:
             df = ak.index_stock_cons(symbol=idx_code)
@@ -65,13 +75,10 @@ def run_monitor():
         except: continue
 
     # 步驟 2: 港股名單
-    print("--- 步驟 2: 獲取港股核心標的 ---")
     hk_raw = {
-        "0005": "匯豐控股", "0939": "建設銀行", "1398": "工商銀行",
-        "3988": "中國銀行", "1288": "農業銀行", "0941": "中國移動",
-        "0883": "中海油", "0386": "中石化", "0857": "中石油",
-        "2628": "中國人壽", "2318": "中國平安", "1088": "中國神華", 
-        "0011": "恆生銀行", "0700": "騰訊控股", "0002": "中電控股"
+        "0005": "匯豐控股", "0939": "建設銀行", "1398": "工商銀行", "3988": "中國銀行",
+        "1288": "農業銀行", "0941": "中國移動", "0883": "中海油", "0386": "中石化",
+        "0857": "中石油", "1088": "中國神華", "2628": "中國人壽", "2318": "中國平安"
     }
     for k, v in hk_raw.items():
         symbol = f"{k.zfill(4)}.HK" if len(k) <= 4 else f"{k.zfill(5)}.HK"
@@ -80,34 +87,32 @@ def run_monitor():
     codes = list(name_map.keys())
     print(f"✅ 掃描範圍：{len(codes)} 隻標的。")
 
-    # 步驟 3: 並行抓取
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_stock = {executor.submit(fetch_single_stock, s, name_map): s for s in codes}
-        for i, future in enumerate(as_completed(future_to_stock)):
+        for future in as_completed(future_to_stock):
             res = future.result()
             if res: results.append(res)
-            if (i+1) % 300 == 0: print(f"進度: {i+1}...")
 
-    # 4. 排序與發送
     if results:
         final_df = pd.DataFrame(results).sort_values(by="殖利率(%)", ascending=False)
         send_to_discord(final_df)
     else:
-        print("💡 掃描完成，無標的。")
+        print("💡 掃描完成，無符合條件標的。")
 
 def send_to_discord(df):
     top_stocks = df.head(25)
-    msg = "### 💎 滬深港三棲價值股監控 (完整版)\n"
-    msg += f"條件：殖利率 {MIN_YIELD}%~{MAX_YIELD}% | PE < {MAX_PE}\n"
+    msg = "### 🏹 價值股底部監控 (高息 + 貼地)\n"
     msg += "```\n"
-    msg += f"{'名稱':<8} {'代碼':<10} {'殖利率':<8} {'PE':<6} {'PB':<5}\n"
-    msg += "-" * 45 + "\n"
+    msg += f"{'名稱':<8} {'代碼':<10} {'殖利率':<8} {'距低點%':<8} {'PE':<6}\n"
+    msg += "-" * 48 + "\n"
     for _, row in top_stocks.iterrows():
         name = str(row['名稱'])[:4]
-        msg += f"{name:<8} {row['代碼']:<10} {row['殖利率(%)']:>7.2f}% {row['PE']:>6.1f} {row['PB']:>5.2f}\n"
+        # 顯示名稱、代碼、殖利率、距離 52 週低點 %、PE
+        msg += f"{name:<8} {row['代碼']:<10} {row['殖利率(%)']:>7.2f}% {row['距低點%']:>7.1f}% {row['PE']:>6.1f}\n"
     msg += "```\n"
-    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
+    msg += f"> *指標說明: 距低點% 越小代表股價越接近一年最低點*"
+    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=15)
 
 if __name__ == "__main__":
     run_monitor()
