@@ -14,76 +14,63 @@ MIN_YIELD = 6.5
 MAX_PE = 20.0
 MAX_WORKERS = 4 # 大幅降低線程數以規避 Rate Limit
 
-def fetch_single_stock(symbol, name_map, max_retries=3):
-    """具備退讓與重試機制的抓取邏輯"""
-    for attempt in range(max_retries):
-        try:
-            # 加入隨機微小延遲 (0.5s ~ 1.5s，稍微拉長以適應近千檔標的)
-            time.sleep(random.uniform(0.5, 1.5))
-            
-            ticker = yf.Ticker(symbol)
-            
-            # 獲取價格
-            price = None
-            if hasattr(ticker, 'fast_info'):
-                price = ticker.fast_info.last_price
-            if not price:
-                info = ticker.info
-                price = info.get('regularMarketPrice') or info.get('currentPrice')
-
-            # 獲取股息 (450天窗口)
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=450)
-            div_history = ticker.dividends
-            div_sum = div_history[div_history.index >= start_date.strftime('%Y-%m-%d')].sum()
-            
-            # 備援：如果歷史記錄為 0，嘗試 dividendRate
-            if div_sum == 0:
-                div_sum = ticker.info.get('dividendRate') or 0
-                
-            dy_pct = (div_sum / price * 100) if price and price > 0 else 0
-
-            # 過濾第一關：殖利率
-            if dy_pct < MIN_YIELD:
-                return None
-
-            # 獲取 PE 與 52週低點
+def fetch_single_stock(symbol, name_map):
+    """具備退讓機制的抓取邏輯"""
+    try:
+        # 加入隨機微小延遲 (0.1s ~ 0.5s)
+        time.sleep(random.uniform(0.1, 0.5))
+        
+        ticker = yf.Ticker(symbol)
+        
+        # 獲取價格
+        price = None
+        if hasattr(ticker, 'fast_info'):
+            price = ticker.fast_info.last_price
+        if not price:
             info = ticker.info
-            pe = info.get('trailingPE')
-            if not pe:
-                eps = info.get('trailingEps')
-                if eps and eps > 0 and price:
-                    pe = price / eps
-            
-            low_52w = info.get('fiftyTwoWeekLow')
-            dist_from_low = ((price - low_52w) / low_52w * 100) if price and low_52w else 0
+            price = info.get('regularMarketPrice') or info.get('currentPrice')
 
-            if pe and 0 < pe <= MAX_PE:
-                return {
-                    "名稱": name_map.get(symbol, "未知"),
-                    "代碼": symbol,
-                    "殖利率(%)": dy_pct,
-                    "距低點%": dist_from_low,
-                    "PE": pe
-                }
+        # 獲取股息 (450天窗口)
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=450)
+        div_history = ticker.dividends
+        div_sum = div_history[div_history.index >= start_date.strftime('%Y-%m-%d')].sum()
+        
+        # 備援：如果歷史記錄為 0，嘗試 dividendRate
+        if div_sum == 0:
+            div_sum = ticker.info.get('dividendRate') or 0
             
-            # 如果不符合條件，正常回傳 None，跳出迴圈
-            return None 
+        dy_pct = (div_sum / price * 100) if price and price > 0 else 0
 
-        except Exception as e:
-            err_msg = str(e)
-            if "Too Many Requests" in err_msg or "429" in err_msg:
-                # 遇到 429，等待時間遞增 (例如: 5秒, 10秒, 15秒)
-                wait_time = (attempt + 1) * 5 
-                print(f"⚠️ Rate limited on {symbol} (第 {attempt+1} 次重試), 暫停 {wait_time} 秒...")
-                time.sleep(wait_time)
-            else:
-                # 若為其他非頻率限制的報錯，則直接略過
-                return None
-                
-    # 如果重試 3 次仍失敗，印出提示
-    print(f"❌ {symbol} 重試 {max_retries} 次仍失敗，已跳過。")
-    return None
+        # 過濾第一關：殖利率
+        if dy_pct < MIN_YIELD:
+            return None
+
+        # 獲取 PE 與 52週低點
+        info = ticker.info
+        pe = info.get('trailingPE')
+        if not pe:
+            eps = info.get('trailingEps')
+            if eps and eps > 0 and price:
+                pe = price / eps
+        
+        low_52w = info.get('fiftyTwoWeekLow')
+        dist_from_low = ((price - low_52w) / low_52w * 100) if price and low_52w else 0
+
+        if pe and 0 < pe <= MAX_PE:
+            return {
+                "名稱": name_map.get(symbol, "未知"),
+                "代碼": symbol,
+                "殖利率(%)": dy_pct,
+                "距低點%": dist_from_low,
+                "PE": pe
+            }
+    except Exception as e:
+        err_msg = str(e)
+        if "Too Many Requests" in err_msg:
+            print(f"⚠️ Rate limited on {symbol}, pausing...")
+            time.sleep(2) # 遇到 429 暫停 2 秒
+        return None
 
 def run_monitor():
     name_map = {}
@@ -144,7 +131,7 @@ def send_to_discord(df):
         name = str(row['名稱'])[:4]
         msg += f"{name:<8} {row['代碼']:<10} {row['殖利率(%)']:>7.2f}% {row['距低點%']:>7.1f}% {row['PE']:>6.1f}\n"
     msg += "```\n"
-    msg += "> *策略: 港股優先 + 頻率限制規避*"
+    msg += f"> *策略: 港股優先 + 頻率限制規避*"
     requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=15)
 
 if __name__ == "__main__":
