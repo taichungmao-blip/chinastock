@@ -1,138 +1,296 @@
-import akshare as ak
-import yfinance as yf
-import pandas as pd
+import json
+import logging
+import math
 import os
-import requests
-import time
 import random
-from datetime import datetime, timedelta
+import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from threading import Lock
 
-# --- 1. 配置區 ---
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
-MIN_YIELD = 6.5
-MAX_PE = 20.0
-MAX_WORKERS = 4 # 大幅降低線程數以規避 Rate Limit
+import akshare as ak
+import pandas as pd
+import requests
+import yfinance as yf
 
-def fetch_single_stock(symbol, name_map):
-    """具備退讓機制的抓取邏輯"""
+try:
+    from deep_translator import GoogleTranslator
+except ImportError:
+    GoogleTranslator = None
+try:
+    from opencc import OpenCC
+    _converter = OpenCC('s2t')
+except ImportError:
+    _converter = None
+
+WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL', '').strip()
+MIN_YIELD = float(os.getenv('MIN_YIELD', '6.5'))
+MAX_PE = float(os.getenv('MAX_PE', '20'))
+MAX_WORKERS = max(1, min(8, int(os.getenv('MAX_WORKERS', '3'))))
+DIVIDEND_LOOKBACK_DAYS = max(1, int(os.getenv('DIVIDEND_LOOKBACK_DAYS', '365')))
+CACHE_DIR = Path(os.getenv('MONITOR_CACHE_DIR', str(Path(__file__).resolve().parent)))
+CONSTITUENTS_CACHE = CACHE_DIR / 'china_hk_constituents_cache.json'
+TRANSLATION_CACHE = CACHE_DIR / 'china_hk_translation_cache.json'
+LOG = logging.getLogger('china_hk_monitor')
+_cache_lock = Lock()
+
+HK_STOCKS = {
+    '0939.HK': '建設銀行', '1398.HK': '工商銀行', '3988.HK': '中國銀行',
+    '1288.HK': '農業銀行', '0941.HK': '中國移動', '0883.HK': '中海油',
+    '1088.HK': '中國神華', '0005.HK': '匯豐控股', '1658.HK': '郵儲銀行',
+    '0386.HK': '中國石化', '0857.HK': '中國石油', '2318.HK': '中國平安',
+}
+INDEX_CODES = {'000010': '上證180', '000009': '上證380', '399001': '深證成指'}
+
+
+def read_cache(path):
     try:
-        # 加入隨機微小延遲 (0.1s ~ 0.5s)
-        time.sleep(random.uniform(0.1, 0.5))
-        
-        ticker = yf.Ticker(symbol)
-        
-        # 獲取價格
-        price = None
-        if hasattr(ticker, 'fast_info'):
-            price = ticker.fast_info.last_price
-        if not price:
-            info = ticker.info
-            price = info.get('regularMarketPrice') or info.get('currentPrice')
+        data = json.loads(path.read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
-        # 獲取股息 (450天窗口)
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=450)
-        div_history = ticker.dividends
-        div_sum = div_history[div_history.index >= start_date.strftime('%Y-%m-%d')].sum()
-        
-        # 備援：如果歷史記錄為 0，嘗試 dividendRate
-        if div_sum == 0:
-            div_sum = ticker.info.get('dividendRate') or 0
-            
-        dy_pct = (div_sum / price * 100) if price and price > 0 else 0
 
-        # 過濾第一關：殖利率
-        if dy_pct < MIN_YIELD:
-            return None
+def save_cache(path, data):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(path.name + '.tmp')
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        temp.replace(path)
+    except OSError as exc:
+        LOG.warning('快取儲存失敗 %s: %s', path, exc)
 
-        # 獲取 PE 與 52週低點
-        info = ticker.info
-        pe = info.get('trailingPE')
-        if not pe:
-            eps = info.get('trailingEps')
-            if eps and eps > 0 and price:
-                pe = price / eps
-        
-        low_52w = info.get('fiftyTwoWeekLow')
-        dist_from_low = ((price - low_52w) / low_52w * 100) if price and low_52w else 0
 
-        if pe and 0 < pe <= MAX_PE:
-            return {
-                "名稱": name_map.get(symbol, "未知"),
-                "代碼": symbol,
-                "殖利率(%)": dy_pct,
-                "距低點%": dist_from_low,
-                "PE": pe
-            }
-    except Exception as e:
-        err_msg = str(e)
-        if "Too Many Requests" in err_msg:
-            print(f"⚠️ Rate limited on {symbol}, pausing...")
-            time.sleep(2) # 遇到 429 暫停 2 秒
+def retry(fn, label, attempts=3):
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            LOG.warning('%s 第 %s/%s 次失敗: %s', label, attempt + 1, attempts, exc)
+            if attempt + 1 < attempts:
+                time.sleep(min(12, 2 ** attempt + random.uniform(0.5, 1.5)))
+    return None
+
+
+def traditional(text):
+    value = str(text or '').strip()
+    return _converter.convert(value) if _converter else value
+
+
+def translate_name(text, cache):
+    """英文名稱才嘗試翻譯；中文名稱只做簡轉繁。"""
+    value = str(text or '').strip()
+    if not value:
+        return '未知'
+    if re.search(r'[\u3400-\u9fff]', value):
+        return traditional(value)
+    if value in cache:
+        return cache[value]
+    if GoogleTranslator is None:
+        return value
+    result = retry(lambda: GoogleTranslator(source='auto', target='zh-TW').translate(value),
+                   f'翻譯 {value}', attempts=3)
+    if result and result.strip():
+        with _cache_lock:
+            cache[value] = traditional(result)
+        return traditional(result)
+    return value
+
+
+def normalize_code(value):
+    """辨識滬市、深市與北交所代碼；不接受非六碼或重複後綴。"""
+    raw = str(value).strip().split('.')[0]
+    if not re.fullmatch(r'\d{1,6}', raw):
+        return None
+    code = raw.zfill(6)
+    if code.startswith(('6', '9')):
+        return f'{code}.SS'
+    if code.startswith(('0', '2', '3')):
+        return f'{code}.SZ'
+    if code.startswith(('4', '8')):
+        return f'{code}.BJ'
+    return None
+
+
+def pick_column(df, options):
+    for col in df.columns:
+        normalized = str(col).strip().lower()
+        if normalized in options:
+            return col
+    return None
+
+
+def get_a_share_stocks():
+    cached = read_cache(CONSTITUENTS_CACHE)
+    previous = cached.get('stocks', {}) if isinstance(cached.get('stocks'), dict) else {}
+    merged = {}
+    success = 0
+    for idx, label in INDEX_CODES.items():
+        LOG.info('讀取 %s (%s)', label, idx)
+        df = retry(lambda code=idx: ak.index_stock_cons(symbol=code), f'指數 {label}')
+        if df is None or df.empty:
+            continue
+        code_col = pick_column(df, {'品种代码', '品種代碼', '证券代码', '證券代碼', 'stock_code', 'code', '成分券代码'})
+        name_col = pick_column(df, {'品种名称', '品種名稱', '证券简称', '證券簡稱', 'stock_name', 'name', '成分券名称'})
+        if code_col is None or name_col is None:
+            LOG.warning('%s 欄位無法辨識：%s', label, list(df.columns))
+            continue
+        found = 0
+        for code, name in zip(df[code_col], df[name_col]):
+            symbol = normalize_code(code)
+            if symbol:
+                merged.setdefault(symbol, traditional(name))
+                found += 1
+        if found:
+            success += 1
+            LOG.info('%s 成功讀取 %s 筆', label, found)
+    # 若部分指數失敗，保留舊快取補足；快取不代表最新成分股。
+    if success:
+        for symbol, name in previous.items():
+            if re.fullmatch(r'\d{6}\.(SS|SZ|BJ)', symbol):
+                merged.setdefault(symbol, traditional(name))
+        save_cache(CONSTITUENTS_CACHE, {'updated_at': datetime.now(timezone.utc).isoformat(), 'stocks': merged})
+    elif previous:
+        LOG.warning('全部指數抓取失敗，改用舊成分股快取（可能過期）')
+        merged = {k: traditional(v) for k, v in previous.items()
+                  if re.fullmatch(r'\d{6}\.(SS|SZ|BJ)', k)}
+    else:
+        LOG.warning('無 A 股名單及快取，僅掃描預設港股')
+    return merged
+
+
+def as_positive_number(value):
+    try:
+        num = float(value)
+        return num if math.isfinite(num) and num > 0 else None
+    except (TypeError, ValueError):
         return None
 
-def run_monitor():
-    name_map = {}
-    
-    # 步驟 1: 先加載港股 (優先處理)
-    print("--- 步驟 1: 加載港股清單 (優先權最高) ---")
-    hk_list = {
-        "0939.HK": "建設銀行", "1398.HK": "工商銀行", "3988.HK": "中國銀行",
-        "1288.HK": "農業銀行", "0941.HK": "中國移動", "0883.HK": "中海油",
-        "1088.HK": "中國神華", "0005.HK": "匯豐控股", "1658.HK": "郵儲銀行",
-        "0386.HK": "中國石化", "0857.HK": "中國石油", "2318.HK": "中國平安"
-    }
-    # 港股放在最前面
-    name_map.update(hk_list)
 
-    # 步驟 2: 加載 A 股名單
-    print("--- 步驟 2: 獲取 A 股名單 ---")
-    indices_a = {"000010": "上證180", "000009": "上證380", "399001": "深證成指"}
-    for idx_code in indices_a:
+def fetch_single_stock(symbol, name_map, translation_cache):
+    """使用最近 N 天現金股息 / 最新價格估算歷史殖利率；非預測殖利率。"""
+    try:
+        time.sleep(random.uniform(0.2, 0.8))
+        ticker = yf.Ticker(symbol)
+        info = None
         try:
-            df = ak.index_stock_cons(symbol=idx_code)
-            c_code = next(c for c in ['品种代码', 'stock_code', 'code'] if c in df.columns)
-            c_name = next(c for c in ['品种名称', 'stock_name', 'name'] if c in df.columns)
-            for _, row in df.iterrows():
-                raw_code = str(row[c_code]).zfill(6)
-                suffix = ".SS" if raw_code.startswith('6') else ".SZ"
-                sym = f"{raw_code}{suffix}"
-                if sym not in name_map:
-                    name_map[sym] = row[c_name]
-        except: continue
+            price = as_positive_number(ticker.fast_info.last_price)
+        except Exception:
+            price = None
+        if price is None:
+            info = retry(lambda: ticker.info, f'{symbol} 基本資料', attempts=2)
+            info = info if isinstance(info, dict) else {}
+            price = as_positive_number(info.get('regularMarketPrice') or info.get('currentPrice'))
+        if price is None:
+            LOG.info('%s 缺少有效股價', symbol)
+            return None
 
-    codes = list(name_map.keys())
-    print(f"✅ 掃描範圍：{len(codes)} 隻標的。")
+        dividends = retry(lambda: ticker.dividends, f'{symbol} 股息紀錄', attempts=2)
+        dividend_sum = None
+        if dividends is not None and not dividends.empty:
+            try:
+                dates = pd.to_datetime(dividends.index, utc=True)
+                cutoff = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=DIVIDEND_LOOKBACK_DAYS)
+                dividend_sum = float(pd.to_numeric(dividends[dates >= cutoff], errors='coerce').fillna(0).sum())
+            except Exception as exc:
+                LOG.warning('%s 股息日期處理失敗: %s', symbol, exc)
+        if info is None:
+            info = retry(lambda: ticker.info, f'{symbol} 基本資料', attempts=2)
+            info = info if isinstance(info, dict) else {}
+        # 僅在股息歷史不可用時使用股息率備援，避免 0 配息誤判。
+        if dividend_sum is None:
+            dividend_sum = as_positive_number(info.get('dividendRate') or info.get('trailingAnnualDividendRate'))
+        if dividend_sum is None:
+            return None
+        yield_pct = dividend_sum / price * 100
+        if not math.isfinite(yield_pct) or yield_pct < MIN_YIELD:
+            return None
 
-    results = []
-    # 使用小規模線程池
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_stock = {executor.submit(fetch_single_stock, s, name_map): s for s in codes}
-        for i, future in enumerate(as_completed(future_to_stock)):
-            res = future.result()
-            if res: results.append(res)
-            if (i+1) % 50 == 0:
-                print(f"已完成: {i+1}/{len(codes)}...")
+        pe = as_positive_number(info.get('trailingPE'))
+        if pe is None:
+            eps = as_positive_number(info.get('trailingEps'))
+            pe = price / eps if eps else None
+        if pe is None or pe > MAX_PE:
+            return None
 
-    if results:
-        final_df = pd.DataFrame(results).sort_values(by="殖利率(%)", ascending=False)
-        send_to_discord(final_df)
-    else:
-        print("💡 掃描完成，無符合標的。")
+        low = as_positive_number(info.get('fiftyTwoWeekLow'))
+        distance = (price / low - 1) * 100 if low else None
+        raw_name = name_map.get(symbol) or info.get('shortName') or symbol
+        return {
+            '名稱': translate_name(raw_name, translation_cache), '代碼': symbol,
+            '市場': '港股' if symbol.endswith('.HK') else 'A股',
+            '殖利率(%)': yield_pct, '距低點%': distance, 'PE': pe,
+        }
+    except Exception as exc:
+        LOG.warning('%s 處理失敗: %s', symbol, exc)
+        return None
+
 
 def send_to_discord(df):
-    top_stocks = df.head(25)
-    msg = "### 🛡️ 滬深港三棲監控 (抗屏蔽穩健版)\n"
-    msg += "```\n"
-    msg += f"{'名稱':<8} {'代碼':<10} {'殖利率':<8} {'距低點%':<8} {'PE':<6}\n"
-    msg += "-" * 48 + "\n"
-    for _, row in top_stocks.iterrows():
-        name = str(row['名稱'])[:4]
-        msg += f"{name:<8} {row['代碼']:<10} {row['殖利率(%)']:>7.2f}% {row['距低點%']:>7.1f}% {row['PE']:>6.1f}\n"
-    msg += "```\n"
-    msg += f"> *策略: 港股優先 + 頻率限制規避*"
-    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=15)
+    if not WEBHOOK_URL:
+        LOG.error('未設定 DISCORD_WEBHOOK_URL，無法推播')
+        return False
+    top = df.head(25)
+    lines = [f'### 🛡️ 滬深港高股息監控｜符合條件 {len(df)} 檔（顯示前 {len(top)} 檔）',
+             f'篩選：近 {DIVIDEND_LOOKBACK_DAYS} 天歷史現金股息殖利率 ≥ {MIN_YIELD:g}%｜0 < PE ≤ {MAX_PE:g}',
+             '```', '名稱 | 代碼 | 殖利率 | 距52週低點 | PE', '-' * 55]
+    for _, row in top.iterrows():
+        distance = 'N/A' if pd.isna(row['距低點%']) else f"{row['距低點%']:.1f}%"
+        lines.append(f"{str(row['名稱'])[:10]} | {row['代碼']} | {row['殖利率(%)']:.2f}% | {distance} | {row['PE']:.1f}")
+    lines += ['```', '註：殖利率依歷史配息估算，非未來保證配息；A/H 股以各自交易貨幣計價。']
+    message = '\n'.join(lines)
+    # Discord content 上限 2000 字元，避免因訊息太長失敗。
+    if len(message) > 1950:
+        message = message[:1900].rsplit('\n', 1)[0] + '\n```'
+    for attempt in range(3):
+        try:
+            response = requests.post(WEBHOOK_URL, json={'content': message}, timeout=20)
+            if response.status_code == 429:
+                wait = min(30, float(response.json().get('retry_after', 3)))
+                LOG.warning('Discord 限流，等待 %.1f 秒', wait)
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            LOG.info('Discord 推播成功')
+            return True
+        except (requests.RequestException, ValueError) as exc:
+            LOG.warning('Discord 推播第 %s 次失敗: %s', attempt + 1, exc)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return False
 
-if __name__ == "__main__":
+
+def run_monitor():
+    if not WEBHOOK_URL:
+        LOG.error('請先設定 DISCORD_WEBHOOK_URL 環境變數')
+        return
+    LOG.info('讀取港股清單與 A 股指數成分股')
+    name_map = dict(HK_STOCKS)
+    name_map.update({k: v for k, v in get_a_share_stocks().items() if k not in name_map})
+    LOG.info('掃描 %s 檔（港股 %s 檔）', len(name_map), len(HK_STOCKS))
+    translation_cache = read_cache(TRANSLATION_CACHE)
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        tasks = {pool.submit(fetch_single_stock, code, name_map, translation_cache): code for code in name_map}
+        for count, future in enumerate(as_completed(tasks), 1):
+            try:
+                item = future.result()
+                if item:
+                    results.append(item)
+            except Exception as exc:
+                LOG.warning('%s 執行緒錯誤: %s', tasks[future], exc)
+            if count % 50 == 0 or count == len(tasks):
+                LOG.info('進度 %s/%s；符合 %s 檔', count, len(tasks), len(results))
+    save_cache(TRANSLATION_CACHE, translation_cache)
+    if not results:
+        LOG.info('掃描完成，沒有符合條件的標的')
+        return
+    df = pd.DataFrame(results).sort_values('殖利率(%)', ascending=False)
+    send_to_discord(df)
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     run_monitor()
