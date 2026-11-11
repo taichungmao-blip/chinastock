@@ -26,7 +26,7 @@ except ImportError:
     _converter = None
 
 WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL', '').strip()
-MIN_YIELD = float(os.getenv('MIN_YIELD', '6.5'))
+MIN_YIELD = float(os.getenv('MIN_YIELD', '7.0'))
 MAX_PE = float(os.getenv('MAX_PE', '20'))
 MAX_WORKERS = max(1, min(8, int(os.getenv('MAX_WORKERS', '3'))))
 DIVIDEND_LOOKBACK_DAYS = max(1, int(os.getenv('DIVIDEND_LOOKBACK_DAYS', '365')))
@@ -42,7 +42,7 @@ HK_STOCKS = {
     '1088.HK': '中國神華', '0005.HK': '匯豐控股', '1658.HK': '郵儲銀行',
     '0386.HK': '中國石化', '0857.HK': '中國石油', '2318.HK': '中國平安',
 }
-INDEX_CODES = {'000010': '上證180', '000009': '上證380', '399001': '深證成指'}
+INDEX_CODES = {'000300': '滬深300', '000010': '上證180', '000009': '上證380', '399001': '深證成指'}
 
 
 def read_cache(path):
@@ -129,11 +129,29 @@ def get_a_share_stocks():
     success = 0
     for idx, label in INDEX_CODES.items():
         LOG.info('讀取 %s (%s)', label, idx)
-        df = retry(lambda code=idx: ak.index_stock_cons(symbol=code), f'指數 {label}')
+        # 滬深300屬於中證指數系列，使用中證指數專用接口；
+        # 其他指數沿用原本的 AKShare 接口。
+        if idx == '000300':
+            df = retry(
+                lambda: ak.index_stock_cons_csindex(symbol='000300'),
+                f'指數 {label}'
+            )
+        else:
+            df = retry(
+                lambda code=idx: ak.index_stock_cons(symbol=code),
+                f'指數 {label}'
+            )
         if df is None or df.empty:
+            LOG.warning('%s 未取得成分股資料', label)
             continue
-        code_col = pick_column(df, {'品种代码', '品種代碼', '证券代码', '證券代碼', 'stock_code', 'code', '成分券代码'})
-        name_col = pick_column(df, {'品种名称', '品種名稱', '证券简称', '證券簡稱', 'stock_name', 'name', '成分券名称'})
+        code_col = pick_column(df, {
+            '品种代码', '品種代碼', '证券代码', '證券代碼',
+            'stock_code', 'code', '成分券代码', '成分券代碼'
+        })
+        name_col = pick_column(df, {
+            '品种名称', '品種名稱', '证券简称', '證券簡稱',
+            'stock_name', 'name', '成分券名称', '成分券名稱'
+        })
         if code_col is None or name_col is None:
             LOG.warning('%s 欄位無法辨識：%s', label, list(df.columns))
             continue
@@ -146,11 +164,8 @@ def get_a_share_stocks():
         if found:
             success += 1
             LOG.info('%s 成功讀取 %s 筆', label, found)
-    # 若部分指數失敗，保留舊快取補足；快取不代表最新成分股。
+    
     if success:
-        for symbol, name in previous.items():
-            if re.fullmatch(r'\d{6}\.(SS|SZ|BJ)', symbol):
-                merged.setdefault(symbol, traditional(name))
         save_cache(CONSTITUENTS_CACHE, {'updated_at': datetime.now(timezone.utc).isoformat(), 'stocks': merged})
     elif previous:
         LOG.warning('全部指數抓取失敗，改用舊成分股快取（可能過期）')
